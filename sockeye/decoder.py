@@ -89,6 +89,10 @@ class Decoder(ABC):
     def __init__(self, dtype):
         logger.info('{}.{} dtype: {}'.format(self.__module__, self.__class__.__name__, dtype))
         self.dtype = dtype
+        self.softmax_temperature = 1.0
+        self.teacher_forcing_probability = 1.0
+        self.block_grad_prev_prediction = False
+
 
     @abstractmethod
     def decode_sequence(self,
@@ -195,6 +199,32 @@ class Decoder(ABC):
         :return: The maximum length supported by the decoder if such a restriction exists.
         """
         return None
+
+    def set_teacher_forcing_probability(self, teacher_forcing_probability, block_grad_prev_prediction):
+        """
+        Sets the teacher forcing probability.
+        When training the sequence prediction model,
+        only the ground truth is used if teacher_forcing_probability == 1.0,
+        only the actual output is used if teacher_forcing_probability == 0.0,
+        otherwise the ground truth is used with teacher_forcing_probability.
+        """
+        self.teacher_forcing_probability = teacher_forcing_probability
+        self.block_grad_prev_prediction = block_grad_prev_prediction
+        self.eos_masks = []
+
+    def set_instantiate_hidden(self,
+                               output_layer: layers.OutputLayer,
+                               embedding_target: encoder.Embedding,
+                               softmax_temperature: float = 1.0,):
+        """
+        Sets the instantiating method when instantiating hidden states is needed.
+        """
+        self.output_layer = output_layer
+        self.embedding_target = embedding_target
+        self.softmax_temperature = softmax_temperature
+
+    def get_eos_mask(self):
+        return mx.sym.stack(*self.eos_masks, axis=1)
 
 
 @Decoder.register(transformer.TransformerConfig, C.TRANSFORMER_DECODER_PREFIX)
@@ -601,18 +631,52 @@ class RecurrentDecoder(Decoder):
         # layer_states: List[(batch_size, state_num_hidden]
         state = self.get_initial_state(source_encoded, source_encoded_lengths)
 
+        # initial word_vec_prev_prediction: (batch_size, rnn_num_hidden)
+        word_vec_prev_prediction = target_embed[0]
         # hidden_all: target_embed_max_length * (batch_size, rnn_num_hidden)
         hidden_states = []  # type: List[mx.sym.Symbol]
+        # mask: (batch_size,)
+        prev_mask = mx.sym.zeros_like(target_embed_lengths)
         # TODO: possible alternative: feed back the context vector instead of the hidden (see lamtram)
         self.reset()
         for seq_idx in range(target_embed_max_length):
-            # hidden: (batch_size, rnn_num_hidden)
-            state, attention_state = self._step(target_embed[seq_idx],
+            if self.block_grad_prev_prediction:
+                word_vec_prev_prediction = mx.sym.BlockGrad(word_vec_prev_prediction)
+            # word_vec_prev: (batch_size, rnn_num_hidden)
+            if self.teacher_forcing_probability == 1.0:
+                word_vec_prev = target_embed[seq_idx]
+            elif self.teacher_forcing_probability == 0.0:
+                word_vec_prev = word_vec_prev_prediction
+            else:
+                teacher_forcing = mx.sym.random_uniform(shape=(1,)) < self.teacher_forcing_probability
+                choose_target_embed = mx.sym.broadcast_mul(target_embed[seq_idx], teacher_forcing)
+                choose_state_hidden = mx.sym.broadcast_mul(word_vec_prev_prediction, 1 - teacher_forcing)
+                word_vec_prev = choose_target_embed + choose_state_hidden
+
+            state, attention_state = self._step(word_vec_prev,
                                                 state,
                                                 attention_func,
                                                 attention_state,
                                                 seq_idx,
                                                 enc_last_hidden=enc_last_hidden)
+
+            # get the next word_vec_prev_prediction: (batch_size, rnn_num_hidden)
+            if self.teacher_forcing_probability < 1.0:
+                # logits: (batch_size, vocab_size)
+                logits = self.output_layer(state.hidden)
+                # instantiate hidden state by st-softmax
+                # word_prev_dist: (batch_size, vocab_size)
+                word_prev_dist = utils.gumbel_softmax(logits, temperature=self.softmax_temperature,
+                                                      noise_scale=.5, st=True, axis=1)
+                # word_vec_prev_prediction: (batch_size, rnn_num_hidden)
+                word_vec_prev_prediction = mx.sym.dot(word_prev_dist, self.embedding_target.embed_weight)
+                # update eos_masks
+                self.eos_masks.append(prev_mask)
+                # word_prev_index: (batch_size,)
+                word_prev_index = mx.sym.argmax(word_prev_dist, axis=1)
+                eos_mask = mx.sym.broadcast_logical_or(word_prev_index == C.EOS_ID, word_prev_index == C.PAD_ID)
+                prev_mask = mx.sym.broadcast_logical_or(prev_mask, eos_mask)
+
             hidden_states.append(state.hidden)
 
         # concatenate along time axis: (batch_size, target_embed_max_length, rnn_num_hidden)

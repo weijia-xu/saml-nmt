@@ -121,6 +121,10 @@ def generate_digits_file(source_path: str,
                 digits.sort()
             print(" ".join(digits), file=target_out)
 
+def generate_vocab_weight_file(file_path: str):
+    with open(file_path, "w") as fout:
+        for digit in _DIGITS:
+            print("%s 1" % digit, file=fout)
 
 def generate_low_high_factors(source_path: str,
                               output_path: str):
@@ -164,19 +168,24 @@ def tmp_digits_dataset(prefix: str,
         dev_target_path = os.path.join(work_dir, "dev.tgt")
         test_source_path = os.path.join(work_dir, "test.src")
         test_target_path = os.path.join(work_dir, "test.tgt")
+        vocab_weight_path = os.path.join(work_dir, "target.wt")
+
         generate_digits_file(train_source_path, train_target_path, train_line_count,
                              train_max_length, sort_target=sort_target, seed=seed_train)
         generate_digits_file(dev_source_path, dev_target_path, dev_line_count, dev_max_length, sort_target=sort_target,
                              seed=seed_dev)
         generate_digits_file(test_source_path, test_target_path, test_line_count, test_max_length,
                              line_count_empty=test_line_count_empty, sort_target=sort_target, seed=seed_dev)
+        generate_vocab_weight_file(vocab_weight_path)
+
         data = {'work_dir': work_dir,
                 'source': train_source_path,
                 'target': train_target_path,
                 'validation_source': dev_source_path,
                 'validation_target': dev_target_path,
                 'test_source': test_source_path,
-                'test_target': test_target_path}
+                'test_target': test_target_path,
+                'vocab_weight': vocab_weight_path}
 
         if with_source_factors:
             train_factor_path = train_source_path + ".factors"

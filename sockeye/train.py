@@ -23,6 +23,7 @@ from contextlib import ExitStack
 from typing import Any, cast, Optional, Dict, List, Tuple
 
 import mxnet as mx
+import numpy as np
 
 from . import arguments
 from . import checkpoint_decoder
@@ -656,7 +657,8 @@ def create_training_model(config: model.ModelConfig,
                           context: List[mx.Context],
                           output_dir: str,
                           train_iter: data_io.BaseParallelSampleIter,
-                          args: argparse.Namespace) -> training.TrainingModel:
+                          args: argparse.Namespace,
+                          vocab_weights: mx.nd.array = None) -> training.TrainingModel:
     """
     Create a training model and load the parameters from disk if needed.
 
@@ -672,10 +674,17 @@ def create_training_model(config: model.ModelConfig,
                                             output_dir=output_dir,
                                             provide_data=train_iter.provide_data,
                                             provide_label=train_iter.provide_label,
+                                            output_loss=args.output_loss,
                                             default_bucket_key=train_iter.default_bucket_key,
                                             bucketing=not args.no_bucketing,
+                                            vocab_weights=vocab_weights,
                                             gradient_compression_params=gradient_compression_params(args),
-                                            fixed_param_names=args.fixed_param_names)
+                                            fixed_param_names=args.fixed_param_names,
+                                            sampling_loss_weight=args.sampling_loss_weight,
+                                            sampling_alignment_type=args.sampling_alignment_type,
+                                            differentiable_sampling=args.differentiable_sampling,
+                                            annealing_schedule_type=args.annealing_schedule_type,
+                                            teacher_forcing_probability_reduce_factor=args.teacher_forcing_probability_reduce_factor)
 
     return training_model
 
@@ -813,6 +822,16 @@ def train(args: argparse.Namespace):
         max_seq_len_source = config_data.max_seq_len_source
         max_seq_len_target = config_data.max_seq_len_target
 
+        vocab_weights = None
+        if args.vocab_weight_file:
+            vocab_weights = np.ones((len(target_vocab)))
+            with open(args.vocab_weight_file, 'r') as fin:
+                for line in fin.readlines():
+                    word, weight = line.strip().split()
+                    if word in target_vocab:
+                        vocab_weights[target_vocab[word]] = weight
+            vocab_weights = mx.nd.array(vocab_weights)
+
         # Dump the vocabularies if we're just starting up
         if not resume_training:
             vocab.save_source_vocabs(source_vocabs, output_folder)
@@ -834,6 +853,7 @@ def train(args: argparse.Namespace):
                                                context=context,
                                                output_dir=output_folder,
                                                train_iter=train_iter,
+                                               vocab_weights=vocab_weights,
                                                args=args)
 
         # Handle options that override training settings
@@ -861,7 +881,8 @@ def train(args: argparse.Namespace):
                                                 optimizer_config=create_optimizer_config(args, source_vocab_sizes),
                                                 max_params_files_to_keep=args.keep_last_params,
                                                 source_vocabs=source_vocabs,
-                                                target_vocab=target_vocab)
+                                                target_vocab=target_vocab,
+                                                output_loss=args.output_loss)
 
         trainer.fit(train_iter=train_iter,
                     validation_iter=eval_iter,

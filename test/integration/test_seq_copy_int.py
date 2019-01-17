@@ -43,10 +43,10 @@ ENCODER_DECODER_SETTINGS = [
      True, False, False),
     # "Kitchen sink" LSTM encoder-decoder with attention
     ("--encoder rnn --decoder rnn --num-layers 3:2 --rnn-cell-type lstm --rnn-num-hidden 8"
-     " --rnn-residual-connections"
-     " --num-embed 8 --rnn-attention-type coverage --rnn-attention-num-hidden 8 --weight-tying "
-     "--rnn-attention-use-prev-word --rnn-context-gating --layer-normalization --batch-size 2 "
-     "--loss cross-entropy --label-smoothing 0.1 --loss-normalization-type batch --optimized-metric perplexity"
+     " --rnn-residual-connections --sampling-loss-weight 0.5 --output-loss saml_loss"
+     " --num-embed 8 --rnn-attention-type coverage --rnn-attention-num-hidden 8 --weight-tying"
+     " --rnn-attention-use-prev-word --rnn-context-gating --layer-normalization --batch-size 2"
+     " --label-smoothing 0.1 --loss-normalization-type batch --optimized-metric perplexity"
      " --max-updates 2 --checkpoint-frequency 2 --optimizer adam --initial-learning-rate 0.01"
      " --rnn-dropout-inputs 0.5:0.1 --rnn-dropout-states 0.5:0.1 --embed-dropout 0.1 --rnn-decoder-hidden-dropout 0.01"
      " --rnn-decoder-state-init avg --rnn-encoder-reverse-input --rnn-dropout-recurrent 0.1:0.0"
@@ -161,6 +161,8 @@ def test_seq_copy(train_params: str,
 
         # Test model configuration, including the output equivalence of batch and no-batch decoding
         translate_params_batch = translate_params + " --batch-size 2"
+
+        train_params = train_params + " --vocab-weight-file " + data['vocab_weight']
 
         # Ignore return values (perplexity and BLEU) for integration test
         run_train_translate(train_params=train_params,

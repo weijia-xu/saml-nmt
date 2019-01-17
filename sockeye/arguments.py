@@ -783,6 +783,34 @@ def add_training_args(params):
 
     add_batch_args(train_params)
 
+    train_params.add_argument('--vocab-weight-file', default=None,
+                               help='File to load vocab weights from.')
+
+    train_params.add_argument('--annealing-schedule-type',
+                              default=C.SCHEDULE_TYPE_INVERSE_SIGMOID,
+                              choices=C.ANNEALING_SCHEDULE_TYPES,
+                              help='Annealing schedule for scheduled sampling. Default: %(default)s.')
+
+    train_params.add_argument('--teacher-forcing-probability-reduce-factor',
+                              type=float,
+                              default=None,
+                              help='The factor of reducing the teacher forcing probability. '
+                                   'This is currently for training RNN decoders only. Default: %(default)s.')
+
+    train_params.add_argument('--sampling-loss-weight',
+                              type=float,
+                              default=None,
+                              help='The weight of the sampling-based cross-entropy loss. Default: %(default)s.')
+
+    train_params.add_argument('--sampling-alignment-type',
+                              default=C.SOFT_ALIGNMENT,
+                              choices=[C.SOFT_ALIGNMENT, C.HARD_ALIGNMENT],
+                              help='Ways to align the sampled target with the reference. Default: %(default)s.')
+
+    train_params.add_argument('--differentiable-sampling',
+                               action='store_true',
+                               help='Use differentiable scheduled sampling. Default: %(default)s.')
+
     train_params.add_argument('--decoder-only',
                               action='store_true',
                               help='Pre-train a decoder. This is currently for RNN decoders only. '
@@ -816,6 +844,10 @@ def add_training_args(params):
                               default=C.PERPLEXITY,
                               choices=C.METRICS,
                               help='Metric to optimize with early stopping {%(choices)s}. Default: %(default)s.')
+    train_params.add_argument('--output-loss',
+                              default=C.MLE_LOSS,
+                              choices=[C.MLE_LOSS, C.SAML_LOSS],
+                              help='Name of loss component to track on training and validation data. Default: %(default)s.')
 
     train_params.add_argument('--min-updates',
                               type=int,

@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mxnet as mx
 import numpy as np
-from math import sqrt
+from math import sqrt, exp
 
 from . import checkpoint_decoder
 from . import constants as C
@@ -55,6 +55,7 @@ class TrainingModel(model.SockeyeModel):
             unrolled to the full length.
     :param gradient_compression_params: Optional dictionary of gradient compression parameters.
     :param fixed_param_names: Optional list of params to fix during training (i.e. their values will not be trained).
+    :param teacher_forcing_probability_reduce_factor: The factor of reducing the teacher forcing probability.
     """
 
     def __init__(self,
@@ -65,14 +66,31 @@ class TrainingModel(model.SockeyeModel):
                  provide_label: List[mx.io.DataDesc],
                  default_bucket_key: Tuple[int, int],
                  bucketing: bool,
+                 vocab_weights: mx.nd.array = None,
+                 output_loss: str = C.MLE_LOSS,
                  gradient_compression_params: Optional[Dict[str, Any]] = None,
-                 fixed_param_names: Optional[List[str]] = None) -> None:
+                 fixed_param_names: Optional[List[str]] = None,
+                 sampling_loss_weight: float = None,
+                 sampling_alignment_type: float = None,
+                 differentiable_sampling: bool = False,
+                 annealing_schedule_type: str = C.SCHEDULE_TYPE_INVERSE_SIGMOID,
+                 teacher_forcing_probability_reduce_factor: float = None) -> None:
         super().__init__(config)
         self.context = context
         self.output_dir = output_dir
+        self.vocab_weights = vocab_weights
         self.fixed_param_names = fixed_param_names
+        self.sampling_loss_weight = sampling_loss_weight
+        self.sampling_alignment_type = sampling_alignment_type
+        self.differentiable_sampling = differentiable_sampling
+        self.annealing_schedule_type = annealing_schedule_type
+        self.teacher_forcing_probability_reduce_factor = teacher_forcing_probability_reduce_factor
+        self._teacher_forcing_probability = 1.0
         self._bucketing = bucketing
         self._gradient_compression_params = gradient_compression_params
+        self._provide_data = provide_data
+        self._provide_label = provide_label
+        self._default_bucket_key = default_bucket_key
         self._initialize(provide_data, provide_label, default_bucket_key)
         self._monitor = None  # type: Optional[mx.monitor.Monitor]
 
@@ -91,10 +109,32 @@ class TrainingModel(model.SockeyeModel):
         target_length = utils.compute_lengths(target)
         labels = mx.sym.reshape(data=mx.sym.Variable(C.TARGET_LABEL_NAME), shape=(-1,))
 
-        self.model_loss = loss.get_loss(self.config.config_loss)
+        vocab_weights = None
+        if self.vocab_weights is not None:
+            vocab_weights = mx.sym.Variable(C.VOCAB_WEIGHT_NAME, shape=(self.config.vocab_target_size))
+            vocab_weights = mx.sym.BlockGrad(vocab_weights)
 
         data_names = [C.SOURCE_NAME, C.TARGET_NAME]
         label_names = [C.TARGET_LABEL_NAME]
+
+        if self.sampling_loss_weight is not None:
+            if self.sampling_alignment_type == C.HARD_ALIGNMENT:
+                self.model_loss = loss.get_loss(
+                    self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY,
+                                                 grad_scale=1 - self.sampling_loss_weight))
+                self.sampling_loss = loss.get_loss(
+                    self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY,
+                                                 grad_scale=self.sampling_loss_weight), prefix="sampling_")
+            elif self.sampling_alignment_type == C.SOFT_ALIGNMENT:
+                self.model_loss = loss.get_loss(
+                    self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY,
+                                                 grad_scale=1 - self.sampling_loss_weight))
+                self.sampling_loss = loss.get_loss(
+                    self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY,
+                                                 grad_scale=self.sampling_loss_weight,
+                                                 ignore_labels=[C.PAD_ID, C.UNK_ID, C.EOS_ID]), prefix="sampling_")
+        else:
+            self.model_loss = loss.get_loss(self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY))
 
         # check provide_{data,label} names
         provide_data_names = [d[0] for d in provide_data]
@@ -130,7 +170,11 @@ class TrainingModel(model.SockeyeModel):
                                                            source_embed_seq_len)
 
             # decoder
-            # target_decoded: (batch-size, target_len, decoder_depth)
+            self.decoder.set_teacher_forcing_probability(self._teacher_forcing_probability, not self.differentiable_sampling)
+            self.decoder.set_instantiate_hidden(softmax_temperature=1,
+                                                output_layer=self.output_layer,
+                                                embedding_target=self.embedding_target)
+            # target_decoded: (batch-size, target_seq_len, decoder_depth)
             target_decoded = self.decoder.decode_sequence(source_encoded, source_encoded_length, source_encoded_seq_len,
                                                           target_embed, target_embed_length, target_embed_seq_len)
 
@@ -140,8 +184,51 @@ class TrainingModel(model.SockeyeModel):
             # output layer
             # logits: (batch_size * target_seq_len, target_vocab_size)
             logits = self.output_layer(target_decoded)
+            loss_output = self.model_loss.get_loss(mx.sym.softmax(logits, axis=1), labels, weights=vocab_weights)
+            loss_output += self.model_loss.get_outputs()
 
-            loss_output = self.model_loss.get_loss(logits, labels)
+            if self.sampling_loss_weight is not None:
+                # decoder
+                self.decoder.set_teacher_forcing_probability(0, not self.differentiable_sampling)
+                self.decoder.set_instantiate_hidden(softmax_temperature=1,
+                                                    output_layer=self.output_layer,
+                                                    embedding_target=self.embedding_target)
+                # target_decoded: (batch-size, target_seq_len, decoder_depth)
+                target_decoded_notf = self.decoder.decode_sequence(source_encoded, source_encoded_length, source_encoded_seq_len,
+                                                                   target_embed, target_embed_length, target_embed_seq_len)
+
+                # target_decoded: (batch_size * target_seq_len, decoder_depth)
+                target_decoded_notf = mx.sym.reshape(data=target_decoded_notf, shape=(-3, 0))
+
+                # output layer
+                # logits: (batch_size * target_seq_len, target_vocab_size)
+                logits_notf = self.output_layer(target_decoded_notf)
+
+                if self.sampling_alignment_type == C.HARD_ALIGNMENT:
+                    loss_output += self.sampling_loss.get_loss(mx.sym.softmax(logits_notf, axis=1), labels, weights=vocab_weights)
+                    loss_output += self.sampling_loss.get_outputs()
+                elif self.sampling_alignment_type == C.SOFT_ALIGNMENT:
+                    # mask: (batch_size * target_seq_len)
+                    # mask: [0 0 0 0 0 0 0 0 1 1]
+                    mask = mx.sym.reshape(data=self.decoder.get_eos_mask(), shape=(-3,))
+                    mask = mx.sym.broadcast_logical_and(mask, labels == C.PAD_ID)
+                    logits_notf = mx.sym.broadcast_mul(logits_notf, mx.sym.expand_dims(mx.sym.logical_not(mask), axis=1))
+                    logits_notf = mx.sym.broadcast_add(logits_notf, mx.sym.expand_dims(- mask * 1e9, axis=1))
+                    # prob: (batch_size * target_seq_len, target_vocab_size)
+                    prob = mx.sym.softmax(logits_notf, temperature=1, axis=1)
+                    # prob: (batch_size, target_seq_len, target_vocab_size)
+                    prob = mx.sym.reshape(data=prob, shape=(-4, -1, target_seq_len, 0))
+                    # seq_prob: (batch_size, target_seq_len, target_vocab_size)
+                    seq_prob = mx.sym.softmax(mx.sym.reshape(logits_notf, shape=(-4, -1, target_seq_len, 0)), axis=1)
+                    # prob: (batch_size, target_seq_len, target_vocab_size)
+                    prob = prob * seq_prob
+                    # prob: (batch-size, target_seq_len, target_vocab_size)
+                    prob = mx.sym.sum(prob, axis=1)
+                    # prob: (batch_size * target_seq_len, target_vocab_size)
+                    prob = mx.sym.repeat(prob, repeats=target_seq_len, axis=0)
+                    # loss_output
+                    loss_output += self.sampling_loss.get_loss(prob, labels, weights=vocab_weights)
+                    loss_output += self.sampling_loss.get_outputs()
 
             return mx.sym.Group(loss_output), data_names, label_names
 
@@ -298,6 +385,12 @@ class TrainingModel(model.SockeyeModel):
         :param initializer: Parameter initializer.
         :param allow_missing_params: Whether to allow missing parameters.
         """
+        if self.vocab_weights is not None:
+            allow_missing_params = True
+            if self.params:
+                self.params[C.VOCAB_WEIGHT_NAME] = self.vocab_weights
+            else:
+                self.params = {C.VOCAB_WEIGHT_NAME: self.vocab_weights}
         self.module.init_params(initializer=initializer,
                                 arg_params=self.params,
                                 aux_params=self.aux_params,
@@ -358,6 +451,32 @@ class TrainingModel(model.SockeyeModel):
         self.module.install_monitor(self._monitor)
         logger.info("Installed MXNet monitor; pattern='%s'; statistics_func='%s'",
                     monitor_pattern, monitor_stat_func_name)
+
+    def adjust_teacher_forcing_probability(self, checkpoint: int, lower_bound: float = 0.5) -> bool:
+        """
+        Adjusts the teacher forcing probability if required.
+        :param checkpoint: Current checkpoint number.
+        :return: Whether the teacher forcing probability was adjusted.
+        """
+        if self.teacher_forcing_probability_reduce_factor is not None:
+            tfprf = self.teacher_forcing_probability_reduce_factor
+            old_tfp = self.decoder.teacher_forcing_probability
+
+            if self.annealing_schedule_type == C.SCHEDULE_TYPE_INVERSE_SIGMOID:
+                new_tfp = tfprf / (tfprf + exp(checkpoint / tfprf))
+            elif self.annealing_schedule_type == C.SCHEDULE_TYPE_EXPONENTIAL:
+                new_tfp = tfprf ** checkpoint
+            elif self.annealing_schedule_type == C.SCHEDULE_TYPE_LINEAR:
+                new_tfp = max(lower_bound, 1 - tfprf * checkpoint)
+            else:
+                new_tfp = old_tfp
+
+            self._teacher_forcing_probability = new_tfp
+            logger.info("Lowering teacher forcing probability: %1.2e -> %1.2e", old_tfp, new_tfp)
+            self._initialize(self._provide_data, self._provide_label, self._default_bucket_key)
+            return True
+
+        return False
 
     @property
     def monitor(self) -> Optional[mx.monitor.Monitor]:
@@ -427,7 +546,8 @@ class EarlyStoppingTrainer:
                  optimizer_config: OptimizerConfig,
                  max_params_files_to_keep: int,
                  source_vocabs: List[vocab.Vocab],
-                 target_vocab: vocab.Vocab) -> None:
+                 target_vocab: vocab.Vocab,
+                 output_loss: str = C.MLE_LOSS) -> None:
         self.model = model
         self.optimizer_config = optimizer_config
         self.max_params_files_to_keep = max_params_files_to_keep
@@ -435,6 +555,12 @@ class EarlyStoppingTrainer:
                                           source_vocab=source_vocabs[0],
                                           target_vocab=target_vocab)
         self.state = None  # type: Optional[TrainState]
+        if output_loss == C.MLE_LOSS:
+            self.output_names = [C.SOFTMAX_OUTPUT_NAME]
+        elif output_loss == C.SAML_LOSS:
+            self.output_names = [C.SAML_SOFTMAX_OUTPUT_NAME]
+        else:
+            raise ValueError("Unknown loss output type: %s" % output_loss)
 
     def fit(self,
             train_iter: data_io.BaseParallelSampleIter,
@@ -638,6 +764,12 @@ class EarlyStoppingTrainer:
                     if stop_fit:
                         break
 
+                # (8) adjust the teacher forcing probability
+                if self.model.adjust_teacher_forcing_probability(self.state.checkpoint):
+                    self._initialize_parameters(existing_parameters, allow_missing_parameters)
+                    self._initialize_optimizer()
+                    self._load_training_state(train_iter)
+
                 tic = time.time()
 
         self._cleanup(lr_decay_opt_states_reset, process_manager=process_manager)
@@ -818,36 +950,37 @@ class EarlyStoppingTrainer:
         return os.path.join(self.model.output_dir, C.TRAINING_STATE_DIRNAME)
 
     @staticmethod
-    def _create_eval_metric(metric_name: str) -> mx.metric.EvalMetric:
+    def _create_eval_metric(metric_name: str, output_names: List[str]) -> mx.metric.EvalMetric:
         """
         Creates an EvalMetric given a metric names.
         """
         # output_names refers to the list of outputs this metric should use to update itself, e.g. the softmax output
         if metric_name == C.ACCURACY:
-            return utils.Accuracy(ignore_label=C.PAD_ID, output_names=[C.SOFTMAX_OUTPUT_NAME])
+            return utils.Accuracy(ignore_label=C.PAD_ID, output_names=output_names)
         elif metric_name == C.PERPLEXITY:
-            return mx.metric.Perplexity(ignore_label=C.PAD_ID, output_names=[C.SOFTMAX_OUTPUT_NAME])
+            return mx.metric.Perplexity(ignore_label=C.PAD_ID, output_names=output_names)
         else:
             raise ValueError("unknown metric name")
 
     @staticmethod
-    def _create_eval_metric_composite(metric_names: List[str]) -> mx.metric.CompositeEvalMetric:
+    def _create_eval_metric_composite(metric_names: List[str], output_names: List[str]) -> mx.metric.CompositeEvalMetric:
         """
         Creates a composite EvalMetric given a list of metric names.
         """
-        metrics = [EarlyStoppingTrainer._create_eval_metric(metric_name) for metric_name in metric_names]
+        metrics = [EarlyStoppingTrainer._create_eval_metric(metric_name, output_names) for metric_name in metric_names]
         return mx.metric.create(metrics)
 
-    def _create_metrics(self, metrics: List[str], optimizer: mx.optimizer.Optimizer,
+    def _create_metrics(self, metrics: List[str],
+                        optimizer: mx.optimizer.Optimizer,
                         loss: loss.Loss) -> Tuple[mx.metric.EvalMetric,
                                                   mx.metric.EvalMetric,
                                                   Optional[mx.metric.EvalMetric]]:
-        metric_train = self._create_eval_metric_composite(metrics)
-        metric_val = self._create_eval_metric_composite(metrics)
+        metric_train = self._create_eval_metric_composite(metrics, self.output_names)
+        metric_val = self._create_eval_metric_composite(metrics, self.output_names)
         # If optimizer requires it, track loss as metric
         if isinstance(optimizer, SockeyeOptimizer):
             if optimizer.request_optimized_metric:
-                metric_loss = self._create_eval_metric(self.state.early_stopping_metric)
+                metric_loss = self._create_eval_metric(self.state.early_stopping_metric, self.output_names)
             else:
                 metric_loss = loss.create_metric()
         else:

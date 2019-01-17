@@ -960,3 +960,28 @@ def inflect(word: str,
         return 'was' if count == 1 else 'were'
     else:
         return word + '(s)'
+
+
+def gumbel_softmax(logits: mx.sym.Symbol,
+                   axis: int = 0,
+                   temperature: float = 1.0,
+                   noise_scale: float = 1.0,
+                   st: bool = False,
+                   eps: float = 1e-20) -> mx.sym.Symbol:
+    """
+    Sample categories from the Gumbel-Softmax distribution.
+    Categorical reparameterization with Gumbel-Softmax (https://arxiv.org/abs/1611.01144)
+    :param logits: e.g. unnormalized log-probs.
+    :param axis: Axis along which to calculate softmax.
+    :param temperature: Softmax temperature (non-negative scalar).
+    :param noise_scale: Gumbel noise scale.
+    :param st: Straight-Through Gumbel-Softmax.
+    :param eps: Parameter for Gumbel distribution.
+    :return: Sample distribution over categories.
+    """
+    gumbel_noise = -mx.sym.log(-mx.sym.log(mx.sym.random_uniform() + eps) + eps) * noise_scale
+    gs = mx.sym.softmax((logits + gumbel_noise) / temperature, axis=axis)
+    if st:
+        st_gs = mx.sym.broadcast_sub(gs, mx.sym.max(gs, axis=axis, keepdims=True)) == 0.0
+        return mx.sym.BlockGrad(st_gs - gs) + gs
+    return gs
