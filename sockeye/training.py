@@ -184,7 +184,7 @@ class TrainingModel(model.SockeyeModel):
             # output layer
             # logits: (batch_size * target_seq_len, target_vocab_size)
             logits = self.output_layer(target_decoded)
-            loss_output = self.model_loss.get_loss(mx.sym.softmax(logits, axis=1), labels, weights=vocab_weights)
+            loss_output = self.model_loss.get_loss(mx.sym.softmax(logits, axis=1), labels)
             loss_output += self.model_loss.get_outputs()
 
             if self.sampling_loss_weight is not None:
@@ -205,7 +205,7 @@ class TrainingModel(model.SockeyeModel):
                 logits_notf = self.output_layer(target_decoded_notf)
 
                 if self.sampling_alignment_type == C.HARD_ALIGNMENT:
-                    loss_output += self.sampling_loss.get_loss(mx.sym.softmax(logits_notf, axis=1), labels, weights=vocab_weights)
+                    loss_output += self.sampling_loss.get_loss(mx.sym.softmax(logits_notf, axis=1), labels)
                     loss_output += self.sampling_loss.get_outputs()
                 elif self.sampling_alignment_type == C.SOFT_ALIGNMENT:
                     # mask: (batch_size * target_seq_len)
