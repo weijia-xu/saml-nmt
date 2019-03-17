@@ -619,6 +619,7 @@ class EarlyStoppingTrainer:
         self._check_args(metrics, early_stopping_metric, lr_decay_opt_states_reset, lr_decay_param_reset, decoder)
         logger.info("Early stopping by optimizing '%s'", early_stopping_metric)
 
+        self.model.adjust_teacher_forcing_probability(checkpoint=1)
         self._initialize_parameters(existing_parameters, allow_missing_parameters)
         self._initialize_optimizer()
 
@@ -765,7 +766,7 @@ class EarlyStoppingTrainer:
                         break
 
                 # (8) adjust the teacher forcing probability
-                if self.model.adjust_teacher_forcing_probability(self.state.checkpoint):
+                if self.model.adjust_teacher_forcing_probability(self.state.checkpoint + 1):
                     self._initialize_parameters(existing_parameters, allow_missing_parameters)
                     self._initialize_optimizer()
                     self._load_training_state(train_iter)
