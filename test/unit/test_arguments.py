@@ -120,7 +120,10 @@ def test_device_args(test_params, expected_params):
               conv_embed_num_highway_layers=4,
               conv_embed_pool_stride=5,
               conv_embed_add_positional_encodings=False,
-              rnn_attention_in_upper_layers=False))
+              rnn_attention_in_upper_layers=False,
+              instantiate_hidden=None,
+              gumbel_noise_scale=1,
+              softmax_temperature=1,))
 ])
 def test_model_parameters(test_params, expected_params):
     _test_args(test_params, expected_params, arguments.add_model_parameters)
@@ -135,9 +138,9 @@ def test_model_parameters(test_params, expected_params):
               annealing_schedule_type=C.SCHEDULE_TYPE_INVERSE_SIGMOID,
               teacher_forcing_probability_reduce_factor=None,
               differentiable_sampling=False,
-              sampling_loss_weight=None,
+              sampling_loss_weight=0,
               sampling_alignment_type=C.SOFT_ALIGNMENT,
-              output_loss=C.MLE_LOSS,
+              vocab_weight_file=None,
               label_smoothing=0.1,
               loss_normalization_type='valid',
               metrics=[C.PERPLEXITY],

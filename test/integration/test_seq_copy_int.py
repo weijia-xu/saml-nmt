@@ -43,7 +43,7 @@ ENCODER_DECODER_SETTINGS = [
      True, False, False),
     # "Kitchen sink" LSTM encoder-decoder with attention
     ("--encoder rnn --decoder rnn --num-layers 3:2 --rnn-cell-type lstm --rnn-num-hidden 8"
-     " --rnn-residual-connections --sampling-loss-weight 0.5 --output-loss saml_loss"
+     " --rnn-residual-connections --sampling-loss-weight 0.5"
      " --num-embed 8 --rnn-attention-type coverage --rnn-attention-num-hidden 8 --weight-tying"
      " --rnn-attention-use-prev-word --rnn-context-gating --layer-normalization --batch-size 2"
      " --label-smoothing 0.1 --loss-normalization-type batch --optimized-metric perplexity"

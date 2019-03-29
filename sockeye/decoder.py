@@ -213,15 +213,19 @@ class Decoder(ABC):
         self.eos_masks = []
 
     def set_instantiate_hidden(self,
+                               instantiate_hidden: str,
                                output_layer: layers.OutputLayer,
                                embedding_target: encoder.Embedding,
-                               softmax_temperature: float = 1.0,):
+                               softmax_temperature: float = 1.0,
+                               gumbel_noise_scale: float = 1.0):
         """
         Sets the instantiating method when instantiating hidden states is needed.
         """
+        self.instantiate_hidden = instantiate_hidden
         self.output_layer = output_layer
         self.embedding_target = embedding_target
         self.softmax_temperature = softmax_temperature
+        self.gumbel_noise_scale = gumbel_noise_scale
 
     def get_eos_mask(self):
         return mx.sym.stack(*self.eos_masks, axis=1)
@@ -666,8 +670,24 @@ class RecurrentDecoder(Decoder):
                 logits = self.output_layer(state.hidden)
                 # instantiate hidden state by st-softmax
                 # word_prev_dist: (batch_size, vocab_size)
-                word_prev_dist = utils.gumbel_softmax(logits, temperature=self.softmax_temperature,
-                                                      noise_scale=.5, st=True, axis=1)
+                word_prev_dist = mx.sym.zeros_like(logits)
+                if self.instantiate_hidden == C.SOFTMAX_NAME:
+                    if self.softmax_temperature != 1.0:
+                        logits = logits / self.softmax_temperature
+                    # word_prev_dist: (batch_size, vocab_size)
+                    word_prev_dist = mx.sym.softmax(logits, axis=1)
+                elif self.instantiate_hidden == C.ST_SOFTMAX_NAME:
+                    # word_prev_dist: (batch_size, vocab_size)
+                    word_prev_dist = utils.gumbel_softmax(logits, temperature=self.softmax_temperature,
+                                                          noise_scale=0, st=True, axis=1)
+                elif self.instantiate_hidden == C.GUMBEL_SOFTMAX_NAME:
+                    # word_prev_dist: (batch_size, vocab_size)
+                    word_prev_dist = utils.gumbel_softmax(logits, temperature=self.softmax_temperature,
+                                                          noise_scale=self.gumbel_noise_scale, axis=1)
+                elif self.instantiate_hidden == C.ST_GUMBEL_SOFTMAX_NAME:
+                    # word_prev_dist: (batch_size, vocab_size)
+                    word_prev_dist = utils.gumbel_softmax(logits, temperature=self.softmax_temperature,
+                                                          noise_scale=self.gumbel_noise_scale, st=True, axis=1)
                 # word_vec_prev_prediction: (batch_size, rnn_num_hidden)
                 word_vec_prev_prediction = mx.sym.dot(word_prev_dist, self.embedding_target.embed_weight)
                 # update eos_masks

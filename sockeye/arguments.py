@@ -759,6 +759,22 @@ def add_model_parameters(params):
                               help="Adds weight normalization to decoder output layers "
                                    "(and all convolutional weight matrices for CNN decoders). Default: %(default)s.")
 
+    model_params.add_argument('--instantiate-hidden',
+                              type=str,
+                              default=None,
+                              choices=C.INSTANTIATING_HIDDEN_CHOICES,
+                              help='Use instantiated hidden states as previous target embeddings. '
+                                   'This is currently for RNN models only. Default: %(default)s.')
+    model_params.add_argument('--softmax-temperature',
+                              type=float,
+                              default=1.0,
+                              help='Controls peakiness of model predictions. Values < 1.0 produce '
+                                   'peaked predictions, values > 1.0 produce smoothed distributions.')
+    model_params.add_argument('--gumbel-noise-scale',
+                              type=float,
+                              default=1.0,
+                              help='Gumbel noise scale.')
+
 
 def add_batch_args(params, default_batch_size=4096):
     params.add_argument('--batch-size', '-b',
@@ -799,7 +815,7 @@ def add_training_args(params):
 
     train_params.add_argument('--sampling-loss-weight',
                               type=float,
-                              default=None,
+                              default=0,
                               help='The weight of the sampling-based cross-entropy loss. Default: %(default)s.')
 
     train_params.add_argument('--sampling-alignment-type',
@@ -844,10 +860,6 @@ def add_training_args(params):
                               default=C.PERPLEXITY,
                               choices=C.METRICS,
                               help='Metric to optimize with early stopping {%(choices)s}. Default: %(default)s.')
-    train_params.add_argument('--output-loss',
-                              default=C.MLE_LOSS,
-                              choices=[C.MLE_LOSS, C.SAML_LOSS],
-                              help='Name of loss component to track on training and validation data. Default: %(default)s.')
 
     train_params.add_argument('--min-updates',
                               type=int,

@@ -67,11 +67,11 @@ class TrainingModel(model.SockeyeModel):
                  default_bucket_key: Tuple[int, int],
                  bucketing: bool,
                  vocab_weights: mx.nd.array = None,
-                 output_loss: str = C.MLE_LOSS,
                  gradient_compression_params: Optional[Dict[str, Any]] = None,
                  fixed_param_names: Optional[List[str]] = None,
-                 sampling_loss_weight: float = None,
-                 sampling_alignment_type: float = None,
+                 instantiate_hidden: str = None,
+                 sampling_loss_weight: float = 0,
+                 sampling_alignment_type: str = C.SOFT_ALIGNMENT,
                  differentiable_sampling: bool = False,
                  annealing_schedule_type: str = C.SCHEDULE_TYPE_INVERSE_SIGMOID,
                  teacher_forcing_probability_reduce_factor: float = None) -> None:
@@ -80,6 +80,7 @@ class TrainingModel(model.SockeyeModel):
         self.output_dir = output_dir
         self.vocab_weights = vocab_weights
         self.fixed_param_names = fixed_param_names
+        self.instantiate_hidden = instantiate_hidden
         self.sampling_loss_weight = sampling_loss_weight
         self.sampling_alignment_type = sampling_alignment_type
         self.differentiable_sampling = differentiable_sampling
@@ -111,30 +112,13 @@ class TrainingModel(model.SockeyeModel):
 
         vocab_weights = None
         if self.vocab_weights is not None:
-            vocab_weights = mx.sym.Variable(C.VOCAB_WEIGHT_NAME, shape=(self.config.vocab_target_size))
-            vocab_weights = mx.sym.BlockGrad(vocab_weights)
+            vocab_weights = mx.sym.BlockGrad(mx.sym.Variable(C.VOCAB_WEIGHT_NAME, shape=(self.config.vocab_target_size)))
 
         data_names = [C.SOURCE_NAME, C.TARGET_NAME]
         label_names = [C.TARGET_LABEL_NAME]
 
-        if self.sampling_loss_weight is not None:
-            if self.sampling_alignment_type == C.HARD_ALIGNMENT:
-                self.model_loss = loss.get_loss(
-                    self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY,
-                                                 grad_scale=1 - self.sampling_loss_weight))
-                self.sampling_loss = loss.get_loss(
-                    self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY,
-                                                 grad_scale=self.sampling_loss_weight), prefix="sampling_")
-            elif self.sampling_alignment_type == C.SOFT_ALIGNMENT:
-                self.model_loss = loss.get_loss(
-                    self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY,
-                                                 grad_scale=1 - self.sampling_loss_weight))
-                self.sampling_loss = loss.get_loss(
-                    self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY,
-                                                 grad_scale=self.sampling_loss_weight,
-                                                 ignore_labels=[C.PAD_ID, C.UNK_ID, C.EOS_ID]), prefix="sampling_")
-        else:
-            self.model_loss = loss.get_loss(self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY))
+        self.model_loss = loss.get_loss(self.config.config_loss)
+        self.custom_loss = loss.get_loss(self.config.config_loss.copy(name=C.CUSTOM_CROSS_ENTROPY))
 
         # check provide_{data,label} names
         provide_data_names = [d[0] for d in provide_data]
@@ -171,9 +155,11 @@ class TrainingModel(model.SockeyeModel):
 
             # decoder
             self.decoder.set_teacher_forcing_probability(self._teacher_forcing_probability, not self.differentiable_sampling)
-            self.decoder.set_instantiate_hidden(softmax_temperature=1,
+            self.decoder.set_instantiate_hidden(instantiate_hidden=self.instantiate_hidden,
                                                 output_layer=self.output_layer,
-                                                embedding_target=self.embedding_target)
+                                                embedding_target=self.embedding_target,
+                                                softmax_temperature=self.config.softmax_temperature,
+                                                gumbel_noise_scale=self.config.gumbel_noise_scale)
             # target_decoded: (batch-size, target_seq_len, decoder_depth)
             target_decoded = self.decoder.decode_sequence(source_encoded, source_encoded_length, source_encoded_seq_len,
                                                           target_embed, target_embed_length, target_embed_seq_len)
@@ -184,15 +170,22 @@ class TrainingModel(model.SockeyeModel):
             # output layer
             # logits: (batch_size * target_seq_len, target_vocab_size)
             logits = self.output_layer(target_decoded)
-            loss_output = self.model_loss.get_loss(mx.sym.softmax(logits, axis=1), labels)
-            loss_output += self.model_loss.get_outputs()
+            # preds: (batch_size * target_seq_len, target_vocab_size)
+            preds = mx.sym.softmax(logits, axis=1)
 
-            if self.sampling_loss_weight is not None:
+            loss_output = self.custom_loss.get_loss(preds=preds,
+                                                    labels=labels,
+                                                    grad_scale=1 - self.sampling_loss_weight)
+            loss_output += self.custom_loss.get_outputs()
+
+            if self.sampling_loss_weight > 0:
                 # decoder
                 self.decoder.set_teacher_forcing_probability(0, not self.differentiable_sampling)
-                self.decoder.set_instantiate_hidden(softmax_temperature=1,
+                self.decoder.set_instantiate_hidden(instantiate_hidden=self.instantiate_hidden,
                                                     output_layer=self.output_layer,
-                                                    embedding_target=self.embedding_target)
+                                                    embedding_target=self.embedding_target,
+                                                    softmax_temperature=self.config.softmax_temperature,
+                                                    gumbel_noise_scale=self.config.gumbel_noise_scale)
                 # target_decoded: (batch-size, target_seq_len, decoder_depth)
                 target_decoded_notf = self.decoder.decode_sequence(source_encoded, source_encoded_length, source_encoded_seq_len,
                                                                    target_embed, target_embed_length, target_embed_seq_len)
@@ -201,15 +194,20 @@ class TrainingModel(model.SockeyeModel):
                 target_decoded_notf = mx.sym.reshape(data=target_decoded_notf, shape=(-3, 0))
 
                 # output layer
-                # logits: (batch_size * target_seq_len, target_vocab_size)
+                # logits_notf: (batch_size * target_seq_len, target_vocab_size)
                 logits_notf = self.output_layer(target_decoded_notf)
 
                 if self.sampling_alignment_type == C.HARD_ALIGNMENT:
-                    loss_output += self.sampling_loss.get_loss(mx.sym.softmax(logits_notf, axis=1), labels)
-                    loss_output += self.sampling_loss.get_outputs()
+                    # preds_notf: (batch_size * target_seq_len, target_vocab_size)
+                    preds_notf = mx.sym.softmax(logits_notf, axis=1)
+                    loss_output += self.custom_loss.get_loss(preds=preds_notf,
+                                                             labels=labels,
+                                                             grad_scale=self.sampling_loss_weight,
+                                                             prefix=C.SAMPLING_PREFIX)
+                    loss_output += self.custom_loss.get_outputs()
                 elif self.sampling_alignment_type == C.SOFT_ALIGNMENT:
                     # mask: (batch_size * target_seq_len)
-                    # mask: [0 0 0 0 0 0 0 0 1 1]
+                    # mask: [0 0 0 0 0 0 0 0 ... 1 1 1]
                     mask = mx.sym.reshape(data=self.decoder.get_eos_mask(), shape=(-3,))
                     mask = mx.sym.broadcast_logical_and(mask, labels == C.PAD_ID)
                     logits_notf = mx.sym.broadcast_mul(logits_notf, mx.sym.expand_dims(mx.sym.logical_not(mask), axis=1))
@@ -222,13 +220,18 @@ class TrainingModel(model.SockeyeModel):
                     seq_prob = mx.sym.softmax(mx.sym.reshape(logits_notf, shape=(-4, -1, target_seq_len, 0)), axis=1)
                     # prob: (batch_size, target_seq_len, target_vocab_size)
                     prob = prob * seq_prob
-                    # prob: (batch-size, target_seq_len, target_vocab_size)
+                    # prob: (batch-size, target_vocab_size)
                     prob = mx.sym.sum(prob, axis=1)
                     # prob: (batch_size * target_seq_len, target_vocab_size)
                     prob = mx.sym.repeat(prob, repeats=target_seq_len, axis=0)
                     # loss_output
-                    loss_output += self.sampling_loss.get_loss(prob, labels, weights=vocab_weights)
-                    loss_output += self.sampling_loss.get_outputs()
+                    loss_output += self.custom_loss.get_loss(preds=prob,
+                                                             labels=labels,
+                                                             weights=vocab_weights,
+                                                             ignore_labels=[C.PAD_ID, C.UNK_ID, C.EOS_ID],
+                                                             grad_scale=self.sampling_loss_weight,
+                                                             prefix=C.SAMPLING_PREFIX)
+                    loss_output += self.custom_loss.get_outputs()
 
             return mx.sym.Group(loss_output), data_names, label_names
 
@@ -546,8 +549,7 @@ class EarlyStoppingTrainer:
                  optimizer_config: OptimizerConfig,
                  max_params_files_to_keep: int,
                  source_vocabs: List[vocab.Vocab],
-                 target_vocab: vocab.Vocab,
-                 output_loss: str = C.MLE_LOSS) -> None:
+                 target_vocab: vocab.Vocab) -> None:
         self.model = model
         self.optimizer_config = optimizer_config
         self.max_params_files_to_keep = max_params_files_to_keep
@@ -555,12 +557,7 @@ class EarlyStoppingTrainer:
                                           source_vocab=source_vocabs[0],
                                           target_vocab=target_vocab)
         self.state = None  # type: Optional[TrainState]
-        if output_loss == C.MLE_LOSS:
-            self.output_names = [C.SOFTMAX_OUTPUT_NAME]
-        elif output_loss == C.SAML_LOSS:
-            self.output_names = [C.SAML_SOFTMAX_OUTPUT_NAME]
-        else:
-            raise ValueError("Unknown loss output type: %s" % output_loss)
+        self.output_names = [C.SOFTMAX_OUTPUT_NAME]
 
     def fit(self,
             train_iter: data_io.BaseParallelSampleIter,

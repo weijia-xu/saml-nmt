@@ -649,6 +649,8 @@ def create_model_config(args: argparse.Namespace,
                                      weight_tying=args.weight_tying,
                                      weight_tying_type=args.weight_tying_type if args.weight_tying else None,
                                      weight_normalization=args.weight_normalization,
+                                     softmax_temperature=args.softmax_temperature,
+                                     gumbel_noise_scale=args.gumbel_noise_scale,
                                      lhuc=args.lhuc is not None)
     return model_config
 
@@ -674,12 +676,12 @@ def create_training_model(config: model.ModelConfig,
                                             output_dir=output_dir,
                                             provide_data=train_iter.provide_data,
                                             provide_label=train_iter.provide_label,
-                                            output_loss=args.output_loss,
                                             default_bucket_key=train_iter.default_bucket_key,
                                             bucketing=not args.no_bucketing,
                                             vocab_weights=vocab_weights,
                                             gradient_compression_params=gradient_compression_params(args),
                                             fixed_param_names=args.fixed_param_names,
+                                            instantiate_hidden=args.instantiate_hidden,
                                             sampling_loss_weight=args.sampling_loss_weight,
                                             sampling_alignment_type=args.sampling_alignment_type,
                                             differentiable_sampling=args.differentiable_sampling,
@@ -881,8 +883,7 @@ def train(args: argparse.Namespace):
                                                 optimizer_config=create_optimizer_config(args, source_vocab_sizes),
                                                 max_params_files_to_keep=args.keep_last_params,
                                                 source_vocabs=source_vocabs,
-                                                target_vocab=target_vocab,
-                                                output_loss=args.output_loss)
+                                                target_vocab=target_vocab)
 
         trainer.fit(train_iter=train_iter,
                     validation_iter=eval_iter,
