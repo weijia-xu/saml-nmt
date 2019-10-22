@@ -1,7 +1,7 @@
 # Differentiable Sampling with Flexible Reference Word Order for Neural Machine Translation
 This is the code we used in our paper:
 
-Differentiable Sampling with Flexible Reference Word Order for Neural Machine Translation
+[Differentiable Sampling with Flexible Reference Word Order for Neural Machine Translation](https://www.aclweb.org/anthology/N19-1207/)
 
 Weijia Xu, Xing Niu, Marine Carpuat
 
